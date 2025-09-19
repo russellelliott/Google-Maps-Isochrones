@@ -81,10 +81,16 @@ function App() {
       setOriginMarker(newOriginMarker);
       map.setCenter(origin);
 
-      // 2. Generate a grid of points around the origin
+      // 2. Generate a multi-resolution grid of points around the origin
       const destinations = [];
-      const gridDensity = 12; // Number of points per axis
       const searchRadiusKm = maxTime / 60 * 50; // Rough estimate based on max speed of 50 km/h
+      
+      // Use adaptive grid density - more points for larger search areas
+      const baseGridDensity = 8;
+      const adaptiveGridDensity = Math.min(baseGridDensity + Math.floor(searchRadiusKm / 10), 20);
+      
+      console.log(`Using adaptive grid density: ${adaptiveGridDensity} (search radius: ${searchRadiusKm.toFixed(1)}km)`);
+      
       const centerLat = origin.lat();
       const centerLng = origin.lng();
       
@@ -92,73 +98,147 @@ function App() {
       const latRange = googleMaps.geometry.spherical.computeOffset(origin, searchRadiusKm * 1000, 0).lat() - centerLat;
       const lngRange = googleMaps.geometry.spherical.computeOffset(origin, searchRadiusKm * 1000, 90).lng() - centerLng;
 
-      for (let i = -gridDensity; i <= gridDensity; i++) {
-        for (let j = -gridDensity; j <= gridDensity; j++) {
-          const lat = centerLat + (latRange / gridDensity) * i;
-          const lng = centerLng + (lngRange / gridDensity) * j;
-          destinations.push(new googleMaps.LatLng(lat, lng));
+      // Create multiple resolution levels for better edge definition
+      const resolutionLevels = [
+        { density: adaptiveGridDensity, weight: 1.0 },     // Main grid
+        { density: Math.floor(adaptiveGridDensity * 1.5), weight: 0.7 }, // Finer grid
+        { density: Math.floor(adaptiveGridDensity * 0.7), weight: 1.2 }  // Coarser grid with wider coverage
+      ];
+
+      resolutionLevels.forEach((level, levelIndex) => {
+        const gridDensity = level.density;
+        const searchMultiplier = level.weight;
+        
+        for (let i = -gridDensity; i <= gridDensity; i++) {
+          for (let j = -gridDensity; j <= gridDensity; j++) {
+            const lat = centerLat + (latRange * searchMultiplier / gridDensity) * i;
+            const lng = centerLng + (lngRange * searchMultiplier / gridDensity) * j;
+            
+            // Add some random jitter to avoid perfectly aligned grid artifacts
+            const jitterLat = lat + (Math.random() - 0.5) * (latRange / gridDensity) * 0.1;
+            const jitterLng = lng + (Math.random() - 0.5) * (lngRange / gridDensity) * 0.1;
+            
+            destinations.push(new googleMaps.LatLng(jitterLat, jitterLng));
+          }
+        }
+      });
+
+      // Add radial points for better circular coverage
+      const radialRings = 6;
+      const pointsPerRing = 16;
+      
+      for (let ring = 1; ring <= radialRings; ring++) {
+        const ringRadius = (searchRadiusKm * 1000 * ring) / radialRings;
+        for (let i = 0; i < pointsPerRing; i++) {
+          const angle = (i / pointsPerRing) * 2 * Math.PI;
+          const point = googleMaps.geometry.spherical.computeOffset(origin, ringRadius, angle * 180 / Math.PI);
+          destinations.push(point);
         }
       }
 
-      console.log(`Generated ${destinations.length} grid points`);
+      console.log(`Generated ${destinations.length} total points across ${resolutionLevels.length} resolution levels + ${radialRings} radial rings`);
 
-      // 3. Batch requests to the Distance Matrix API to stay within limits
+      // 3. Batch requests to the Distance Matrix API with intelligent chunking
       const results = [];
-      const chunkSize = 25;
+      const chunkSize = 25; // Google Maps API limit
+      const maxConcurrentRequests = 3; // Limit concurrent requests to avoid rate limiting
       let processedChunks = 0;
       
+      // Split destinations into chunks
+      const chunks = [];
       for (let i = 0; i < destinations.length; i += chunkSize) {
-        const chunk = destinations.slice(i, i + chunkSize);
+        chunks.push(destinations.slice(i, i + chunkSize));
+      }
+      
+      console.log(`Processing ${chunks.length} chunks with max ${maxConcurrentRequests} concurrent requests`);
+      
+      // Process chunks in batches to avoid overwhelming the API
+      for (let batchStart = 0; batchStart < chunks.length; batchStart += maxConcurrentRequests) {
+        const currentBatch = chunks.slice(batchStart, batchStart + maxConcurrentRequests);
         
-        const matrixResponse = await new Promise((resolve, reject) => {
-          distanceMatrixService.getDistanceMatrix({
-            origins: [origin],
-            destinations: chunk,
-            travelMode: googleMaps.TravelMode[travelMode],
-            unitSystem: googleMaps.UnitSystem.METRIC,
-            drivingOptions: travelMode === 'DRIVING' ? {
-              departureTime: new Date(),
-              trafficModel: googleMaps.TrafficModel.BEST_GUESS
-            } : undefined,
-          }, (response, status) => {
-            if (status === 'OK') {
-              resolve(response);
-            } else {
-              reject(new Error(`Distance Matrix API failed: ${status}`));
-            }
+        // Process current batch concurrently
+        const batchPromises = currentBatch.map((chunk, chunkIndexInBatch) => {
+          const globalChunkIndex = batchStart + chunkIndexInBatch;
+          
+          return new Promise((resolve, reject) => {
+            distanceMatrixService.getDistanceMatrix({
+              origins: [origin],
+              destinations: chunk,
+              travelMode: googleMaps.TravelMode[travelMode],
+              unitSystem: googleMaps.UnitSystem.METRIC,
+              drivingOptions: travelMode === 'DRIVING' ? {
+                departureTime: new Date(),
+                trafficModel: googleMaps.TrafficModel.BEST_GUESS
+              } : undefined,
+            }, (response, status) => {
+              if (status === 'OK') {
+                resolve({
+                  elements: response.rows[0].elements,
+                  chunkIndex: globalChunkIndex,
+                  startIndex: globalChunkIndex * chunkSize
+                });
+              } else {
+                console.warn(`Chunk ${globalChunkIndex} failed with status: ${status}`);
+                resolve({
+                  elements: [],
+                  chunkIndex: globalChunkIndex,
+                  startIndex: globalChunkIndex * chunkSize
+                });
+              }
+            });
           });
         });
         
-        results.push(...matrixResponse.rows[0].elements);
-        processedChunks++;
-        console.log(`Processed chunk ${processedChunks}/${Math.ceil(destinations.length / chunkSize)}`);
+        // Wait for current batch to complete
+        const batchResults = await Promise.all(batchPromises);
         
-        // Add small delay between requests to avoid rate limiting
-        if (i + chunkSize < destinations.length) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+        // Process results from this batch
+        batchResults.forEach(batchResult => {
+          results.push(...batchResult.elements.map((element, idx) => ({
+            element,
+            destinationIndex: batchResult.startIndex + idx
+          })));
+          processedChunks++;
+          console.log(`Processed chunk ${batchResult.chunkIndex + 1}/${chunks.length}`);
+        });
+        
+        // Add delay between batches to be respectful to the API
+        if (batchStart + maxConcurrentRequests < chunks.length) {
+          await new Promise(resolve => setTimeout(resolve, 200));
         }
       }
 
       // 4. Filter the points that are within the max travel time
       const validPoints = [];
-      results.forEach((element, index) => {
+      results.forEach((result) => {
+        const element = result.element;
+        const destinationIndex = result.destinationIndex;
+        
         if (element.status === 'OK') {
           // Use duration_in_traffic if available (for driving), otherwise use duration
           const duration = element.duration_in_traffic ? element.duration_in_traffic.value : element.duration.value;
           if (duration <= maxTime * 60) {
-            validPoints.push(destinations[index]);
+            validPoints.push(destinations[destinationIndex]);
           }
         }
       });
 
-      console.log(`Found ${validPoints.length} reachable points out of ${destinations.length} total points`);
+      console.log(`Found ${validPoints.length} reachable points out of ${destinations.length} total points (${(validPoints.length/destinations.length*100).toFixed(1)}% reachable)`);
 
       if (validPoints.length < 3) {
         throw new Error('Not enough reachable points to create an isochrone. Try increasing the travel time or changing the travel mode.');
       }
 
-      // 5. Create a polygon from the valid points using convex hull
-      const hull = getConvexHull(validPoints);
+      // 5. Create a more refined polygon using alpha shapes or better hull algorithm
+      let hull;
+      
+      if (validPoints.length > 50) {
+        // For larger datasets, use a more sophisticated approach
+        hull = getAlphaShape(validPoints, searchRadiusKm);
+      } else {
+        // For smaller datasets, use convex hull
+        hull = getConvexHull(validPoints);
+      }
 
       const newPolygon = new googleMaps.Polygon({
         paths: hull,
@@ -184,6 +264,41 @@ function App() {
       setLoading(false);
     }
   }, [map, address, maxTime, travelMode, originMarker, isochronePolygon]);
+
+  // Alpha shape algorithm for more natural boundaries with large point sets
+  const getAlphaShape = (points, searchRadiusKm) => {
+    // For now, we'll use a refined convex hull with boundary smoothing
+    // This is a simplified alpha shape approach
+    const hull = getConvexHull(points);
+    
+    // Add intermediate points along the hull edges for smoother curves
+    const smoothedHull = [];
+    for (let i = 0; i < hull.length; i++) {
+      const current = hull[i];
+      const next = hull[(i + 1) % hull.length];
+      
+      smoothedHull.push(current);
+      
+      // Add intermediate points for longer edges
+      const distance = window.google.maps.geometry.spherical.computeDistanceBetween(current, next);
+      if (distance > 2000) { // If edge is longer than 2km, add intermediate points
+        const bearing = window.google.maps.geometry.spherical.computeHeading(current, next);
+        const numIntermediatePoints = Math.min(Math.floor(distance / 1000), 3);
+        
+        for (let j = 1; j <= numIntermediatePoints; j++) {
+          const intermediateDistance = (distance * j) / (numIntermediatePoints + 1);
+          const intermediatePoint = window.google.maps.geometry.spherical.computeOffset(
+            current, 
+            intermediateDistance, 
+            bearing
+          );
+          smoothedHull.push(intermediatePoint);
+        }
+      }
+    }
+    
+    return smoothedHull;
+  };
 
   // Convex Hull algorithm (Graham Scan variant)
   const getConvexHull = (points) => {
